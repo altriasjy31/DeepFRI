@@ -19,3 +19,8 @@ results
 trained_models/*
 newest_trained/*
 alphafold2
+
+# data
+*.csv
+*.tsv
+preprocessing/data/*
