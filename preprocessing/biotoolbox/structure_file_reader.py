@@ -81,14 +81,16 @@ class StructureContainer:
         return json.dumps(result, default=lambda o: o.__dict__,
                           sort_keys=True, indent=4, skipkeys=True)
 
-def build_structure_container_for_pdb(structure_data, chain_name):
+def build_structure_container_for_pdb(structure_data, chain_name,
+                                      parser_mode=None):
     # Test the data to see if this looks like a PDB or an mmCIF
     tester = re.compile('^_', re.MULTILINE)
-    if len(tester.findall(structure_data)) == 0:
-        # PDB
-        parser_mode = 'pdb'
-    else:
-        parser_mode = 'cif'
+    if parser_mode is None:
+        if len(tester.findall(structure_data)) == 0:
+            # PDB
+            parser_mode = 'pdb'
+        else:
+            parser_mode = 'cif'
 
     temp = tempfile.TemporaryFile(mode='w+')
     temp.write(str(structure_data))

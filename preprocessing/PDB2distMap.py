@@ -1,8 +1,14 @@
 #!/usr/bin/env python
 
-from create_nrPDB_GO_annot import read_fasta, load_clusters
-from biotoolbox.structure_file_reader import build_structure_container_for_pdb
-from biotoolbox.contact_map_builder import DistanceMapBuilder
+import pathlib as P
+prj_root = P.Path(__file__).parent.parent
+import sys
+if (p := str(prj_root)) not in sys.path:
+    sys.path.append(p)
+
+from preprocessing.create_nrPDB_GO_annot import read_fasta, load_clusters
+from preprocessing.biotoolbox.structure_file_reader import build_structure_container_for_pdb
+from preprocessing.biotoolbox.contact_map_builder import DistanceMapBuilder
 from Bio.PDB import PDBList
 
 from functools import partial
@@ -10,13 +16,27 @@ import numpy as np
 import argparse
 import csv
 import os
+import re
+import gzip
 
+SUFFIXPATTERN = re.compile(r'(?!^)\.[^\.]+$')
+
+# ALPHAFOLDNAME = re.compile(r'(?:AF-(\w+)-F1-model_v4(?:\.[^.]+)+$)')
 
 def make_distance_maps(pdbfile, chain=None, sequence=None):
     """
     Generate (diagonalized) C_alpha and C_beta distance matrix from a pdbfile
     """
-    pdb_handle = open(pdbfile, 'r')
+    # gzip format and pdb (cif) format
+    m = SUFFIXPATTERN.search(pdbfile)
+    if m is None:
+        raise ValueError(f"Unknown file format {pdbfile}")
+    elif (r := m.group()) in [".pdb", ".cif"]:
+            pdb_handle = open(pdbfile, 'r')
+    elif r in [".gz", ".gzip"]:
+            pdb_handle = gzip.open(pdbfile, "rt")
+    else:
+        raise ValueError(f"Unknown file format {pdbfile}")
     structure_container = build_structure_container_for_pdb(pdb_handle.read(), chain).with_seqres(sequence)
     # structure_container.chains = {chain: structure_container.chains[chain]}
 
@@ -81,10 +101,15 @@ def load_EC_annot(filename):
     return prot2annot, ec_numbers
 
 
-def retrieve_pdb(pdb, chain, chain_seqres, pdir):
-    pdb_list = PDBList()
-    pdb_list.retrieve_pdb_file(pdb, pdir=pdir)
-    ca, cb = make_distance_maps(pdir + '/' + pdb +'.cif', chain=chain, sequence=chain_seqres)
+def pdb2distMap(pdb, chain, chain_seqres, pdir,
+                 **kwargs):
+    no_retrieve = kwargs.get('no_retrieve', False)
+    gzip = kwargs.get('gzip', False)
+    if not no_retrieve:
+        pdb_list = PDBList()
+        pdb_list.retrieve_pdb_file(pdb, pdir=pdir)
+    ca, cb = make_distance_maps(pdir + '/' + pdb +'.cif' + ('.gz' if gzip else ''), 
+                                chain=chain, sequence=chain_seqres)
 
     return ca[chain]['contact-map'], cb[chain]['contact-map']
 
@@ -102,14 +127,29 @@ def load_list(fname):
     return pdb_chain_list
 
 
-def write_annot_npz(prot, prot2seq=None, out_dir=None):
+def write_annot_npz(prot, prot2seq=None,in_dir=None, out_dir=None,
+                    **kwargs):
     """
     Write to *.npz file format.
     """
-    pdb, chain = prot.split('-')
+    alphafold_db = kwargs.get('alphafold_db', False)
+    if alphafold_db:
+        # pdb = ALPHAFOLDNAME.search(prot).group(1)
+        # m = ALPHAFOLDNAME.search(prot)
+        # assert m is not None, f"Cannot parse {prot}"
+        # pdb = m.group(1)
+        pdb = prot
+        chain = "A" # default chain is A
+    else:
+        pdb, chain = prot.split('-')
     print ('pdb=', pdb, 'chain=', chain)
+    pdir = in_dir if in_dir is not None else os.path.join(out_dir, 'tmp_PDB_files_dir')
     try:
-        A_ca, A_cb = retrieve_pdb(pdb.lower(), chain, prot2seq[prot], pdir=os.path.join(out_dir, 'tmp_PDB_files_dir'))
+        A_ca, A_cb = pdb2distMap(pdb.lower() if not alphafold_db else pdb,
+                                 chain, 
+                                 prot2seq[prot] if not alphafold_db else prot2seq[pdb], 
+                                 pdir=pdir,
+                                 **kwargs)
         np.savez_compressed(os.path.join(out_dir, prot),
                             C_alpha=A_ca,
                             C_beta=A_cb,
@@ -125,7 +165,11 @@ if __name__ == '__main__':
     parser.add_argument('-seqres', type=str, default='./data/pdb_seqres.txt.gz', help="PDB chain seqres fasta.")
     parser.add_argument('-num_threads', type=int, default=20, help="Number of threads (CPUs) to use in the computation.")
     parser.add_argument('-bc', type=str, help="Clusters of PDB chains computd by Blastclust.")
+    parser.add_argument("-in_dir", type=str, default=None, help="Input directory with PDB files.")
     parser.add_argument('-out_dir', type=str, default='./data/annot_pdb_chains_npz/', help="Output directory with distance maps saved in *.npz format.")
+    parser.add_argument("--no_retrieve", action="store_true", help="Do not retrieve PDB files.")
+    parser.add_argument("--alphafold_db", action="store_true", help="from alphafold_db")
+    parser.add_argument("--gzip", action="store_true", help="PDB files are in gzip format.")
     args = parser.parse_args()
 
     # load annotations
@@ -160,20 +204,28 @@ if __name__ == '__main__':
     to_be_processed = set(prot2seq.keys())
     if len(prot2goterms) != 0:
         to_be_processed = to_be_processed.intersection(set(prot2goterms.keys()))
-    if len(prot2goterms) != 0:
+    if pdb2clust != {} and len(prot2goterms) != 0:
         to_be_processed = to_be_processed.intersection(set(pdb2clust.keys()))
     print ("Number of pdbs to be processed=", len(to_be_processed))
     print (to_be_processed)
 
     # process on multiple cpus
     nprocs = args.num_threads
+    in_dir = args.in_dir
     out_dir = args.out_dir
     import multiprocessing
     nprocs = np.minimum(nprocs, multiprocessing.cpu_count())
     if nprocs > 4:
         pool = multiprocessing.Pool(processes=nprocs)
-        pool.map(partial(write_annot_npz, prot2seq=prot2seq, out_dir=out_dir),
-                 to_be_processed)
+        pool.map(partial(write_annot_npz, 
+                         prot2seq=prot2seq, 
+                         in_dir=in_dir, 
+                         out_dir=out_dir,
+                         no_retrieve=args.no_retrieve,
+                         alphafold_db=args.alphafold_db,
+                         gzip=args.gzip,),
+                 to_be_processed,
+                 )
     else:
         for prot in to_be_processed:
             write_annot_npz(prot, prot2seq=prot2seq, out_dir=out_dir)
